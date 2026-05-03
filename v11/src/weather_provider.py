@@ -24,9 +24,10 @@ class WeatherDataProvider:
         self.base_url = "https://power.larc.nasa.gov/api/temporal/daily/point"
         self.parameters = "WS10M,T2M,RH2M,T2M_MIN,T2M_MAX,PRECTOTCORR"
         
-    def get_weather_history(self, location, target_date, window_days=120):
+    def get_weather_history(self, location, target_date, window_days=400):
         """
-        Fetches t-120 to t weather data for a location.
+        Fetches historical weather data for a location.
+        The inference engine needs ~400 days to compute 365-day rolling Z-scores.
         location: region name (str) or dict {"lat": float, "lon": float}
         """
         if isinstance(location, str):

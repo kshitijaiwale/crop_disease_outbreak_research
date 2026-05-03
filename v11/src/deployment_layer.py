@@ -19,10 +19,10 @@ from alert_engine import evaluate_alert_state
 
 # Hardcoded agronomic defaults by region for V11 (Fallback if farmer doesn't provide)
 REGION_DEFAULTS = {
-    "Sangli": {"variety_susceptibility": 4, "is_ratoon": 1, "crop_age_days": 180},
-    "Kolhapur": {"variety_susceptibility": 3, "is_ratoon": 0, "crop_age_days": 150},
-    "Pune": {"variety_susceptibility": 2, "is_ratoon": 0, "crop_age_days": 120},
-    "DEFAULT": {"variety_susceptibility": 3, "is_ratoon": 0, "crop_age_days": 150}
+    "Sangli":   {"variety_susceptibility": 2, "is_ratoon": 1, "crop_age_days": 180},
+    "Kolhapur": {"variety_susceptibility": 1, "is_ratoon": 0, "crop_age_days": 150},
+    "Pune":     {"variety_susceptibility": 1, "is_ratoon": 0, "crop_age_days": 120},
+    "DEFAULT":  {"variety_susceptibility": 1, "is_ratoon": 0, "crop_age_days": 150},
 }
 
 class DeploymentAPI:
@@ -64,7 +64,7 @@ class DeploymentAPI:
             explanations.append(f"Recent rainfall ({rain_sum:.1f}mm) is sufficient to trigger the spread of spores across the field.")
         if 20 <= t2m_lag <= 28:
             explanations.append("Nighttime temperatures from two weeks ago were optimal for initial fungal incubation.")
-        if v_susc >= 4:
+        if v_susc >= 2:
             explanations.append("Your crop variety is highly susceptible to Red Rot in these conditions.")
             
         if not explanations:
@@ -115,7 +115,9 @@ class DeploymentAPI:
         )
         
         # 5. Alert Orchestration (Event Clustering)
-        alert_state, alert_message = evaluate_alert_state(location, target_date, inf_out["risk_class"])
+        alert_result = evaluate_alert_state(location, target_date, inf_out["risk_class"])
+        alert_state   = alert_result["status"]
+        alert_message = alert_result["message"]
         
         # 6. Output Construction
         status_msg = alert_message
@@ -127,6 +129,7 @@ class DeploymentAPI:
             "prediction_id": pred_id,
             "risk_score": round(inf_out["risk_score"], 4),
             "risk_class": inf_out["risk_class"],
+            "confidence_score": round(inf_out["confidence_score"], 4),
             "lead_time_window": "3–7 days",
             "explanation": explanation_text,
             "advisory_action": advisory_text,

@@ -167,15 +167,15 @@ def generate_explanation(
             f"— below-normal minimum temperatures may have stressed crop immunity."
         )
 
-    # Variety susceptibility: 1 (resistant) – 5 (highly susceptible)
-    if variety_susc >= 4:
+    # Variety susceptibility: 0 (resistant) – 2 (susceptible)
+    if variety_susc >= 2:
         drivers.append(
-            f"Highly susceptible variety (score {int(variety_susc)}/5) — "
+            f"Highly susceptible variety (score {int(variety_susc)}/2) — "
             f"agronomic vulnerability amplifies weather-driven risk."
         )
-    elif variety_susc == 3:
+    elif variety_susc == 1:
         drivers.append(
-            f"Moderately susceptible variety (score {int(variety_susc)}/5) — "
+            f"Moderately susceptible variety (score {int(variety_susc)}/2) — "
             f"intermediate host vulnerability."
         )
 

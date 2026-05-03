@@ -33,7 +33,12 @@ target_date = st.sidebar.date_input("Target Prediction Date", datetime.now())
 st.sidebar.header("🚜 Agronomic Inputs (Optional)")
 is_ratoon = st.sidebar.checkbox("Is Ratoon Crop?", value=False)
 crop_age = st.sidebar.slider("Crop Age (Days)", 0, 360, 150)
-variety_susc = st.sidebar.select_slider("Variety Susceptibility", options=[1, 2, 3, 4, 5], value=3)
+variety_susc = st.sidebar.select_slider(
+    "Variety Susceptibility",
+    options=[0, 1, 2],
+    value=1,
+    format_func=lambda x: {0: "Resistant", 1: "Moderate", 2: "Susceptible"}[x]
+)
 
 # Action Button
 if st.sidebar.button("Run Real-Time Inference"):
