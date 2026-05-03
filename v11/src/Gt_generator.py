@@ -74,6 +74,15 @@ USAGE
 
   Outputs go to:  research_comp/evidence_base/outbreak_events/
   Audit trail:    same directory, _audit suffix
+
+CHANGES (v2.1)
+--------------
+[BUG]  GT CSV previously wrote only ["peak_start", "region"], silently
+       discarding confidence, source, intensity and event_index_in_year.
+       Any downstream filtering by confidence tier required a re-join
+       against the audit CSV. All columns are now written to the main
+       GT CSV. Consumers that previously relied on exactly two columns
+       should read by column name, not by position.
 """
 
 import os
@@ -475,8 +484,11 @@ def generate_gt():
         })
 
     # ── Write GT CSV ─────────────────────────────────────────────────────────
+    # Write all columns so downstream consumers can filter by confidence tier
+    # (e.g. train only on HIGH+MEDIUM events) without joining against the audit
+    # CSV. Consumers that need only peak_start should read that column directly.
     gt_df = pd.DataFrame(gt_rows).sort_values("peak_start")
-    gt_df[["peak_start", "region"]].to_csv(GT_PATH, index=False)
+    gt_df.to_csv(GT_PATH, index=False)
     print(f"\nGT saved ({len(gt_df)} events):\n  {GT_PATH}")
 
     # ── Write audit CSV ──────────────────────────────────────────────────────

@@ -6,6 +6,20 @@ research_comp/evidence_base/outbreak_events/sangli_synthetic_gt.csv
 
 Produces a comprehensive report for all events across all years.
 
+CHANGELOG (v11.2):
+  - [CRITICAL]  GT_PATH updated from sangli_synthetic_gt.csv to
+                sangli_gt_v2.csv to match train.py. Using the old GT
+                file would evaluate against a different event set than
+                the model was trained on.
+  - [CRITICAL]  assign_causal_labels_v2.assign_labels() called after
+                warmup filter. risk_label is not persisted in the CSV —
+                it is computed at runtime. validate_pipeline.py was
+                crashing with KeyError: risk_label because the stale
+                CSV predates the v2 label integration in train.py.
+  - [CRITICAL]  FileNotFoundError guard added for GT_PATH. A missing
+                GT file previously produced a cryptic pandas read error;
+                now produces a clear actionable message.
+
 CHANGELOG (v11.1):
   - [CRITICAL]  load_metadata() switched from .txt parser to json.load().
                 train.py now writes v11_metadata.json.
@@ -19,7 +33,7 @@ CHANGELOG (v11.1):
                 comparisons (NaN >= threshold is always False), suppressing
                 alerts for those dates with no warning.
   - [BUG]       Threshold search reversed to descending (0.99 → 0.01).
-                Ascending search found the lowest threshold satisfying FPR ≤ 5%
+                Ascending search found the lowest threshold satisfying FPR <= 5%
                 (nearly always ~0.01), producing near-zero precision.
                 Descending search finds the most conservative (highest) valid
                 threshold.
@@ -38,6 +52,17 @@ CHANGELOG (v11.1):
                 batch loop.
   - [DESIGN]    Train detection rate clearly labelled as in-sample
                 memorisation check, not a generalisation metric.
+
+CHANGELOG (v11.3):
+  - [BUG]       Detection window was hardcoded as [peak-14, peak-7] but
+                assign_causal_labels_v2 labels [peak-10, peak-7]. Alerts
+                in [peak-14, peak-11] were counted as detections even
+                though no risk_label=1 exists there, inflating detection
+                rates. Window now imported from assign_causal_labels_v2 as
+                LABEL_WINDOW_FAR / LABEL_WINDOW_NEAR — single source of truth.
+  - [STYLE]     from assign_causal_labels_v2 import assign_labels moved to
+                top-level imports (was deferred inside main()). Also imports
+                LABEL_WINDOW_FAR and LABEL_WINDOW_NEAR from the same module.
 """
 
 import os
@@ -47,8 +72,10 @@ import pandas as pd
 from datetime import timedelta
 import torch
 import joblib
+from sklearn.metrics import precision_recall_curve, average_precision_score
 
 from model import KGCTCN
+from assign_causal_labels_v2 import assign_labels, LABEL_WINDOW_FAR, LABEL_WINDOW_NEAR
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -60,8 +87,8 @@ MODEL_DIR    = os.path.join(BASE_DIR, "models")
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
 
 GT_PATH = os.path.join(
-    PROJECT_ROOT,
-    "research_comp", "evidence_base", "outbreak_events", "sangli_synthetic_gt.csv",
+    BASE_DIR,
+    "research_comp", "evidence_base", "outbreak_events", "sangli_gt_v2.csv",
 )
 
 BATCH_SIZE = 512
@@ -81,28 +108,19 @@ def load_metadata() -> dict:
 # Threshold calibration
 # ---------------------------------------------------------------------------
 
-def find_threshold_at_fpr(
+def find_optimal_threshold(
     probs: np.ndarray,
     labels: np.ndarray,
-    max_fpr: float = 0.05,
-    fallback: float = 0.5,
 ) -> float:
-    """
-    Return the highest threshold t such that FPR(t) ≤ max_fpr.
-
-    Descending search (0.99 → 0.01) finds the most conservative threshold
-    that still satisfies the FPR budget, maximising precision at the
-    operating point. Ascending search would find the *lowest* valid
-    threshold (near 0.01), which predicts almost everything as positive.
-    """
-    n_neg = (labels == 0).sum()
-    if n_neg == 0:
-        return fallback
-    for t in np.linspace(0.99, 0.01, 99):
-        fpr_t = ((probs >= t) & (labels == 0)).sum() / n_neg
-        if fpr_t <= max_fpr:
-            return float(round(t, 4))
-    return fallback
+    """Find threshold that maximises F2 score (recall weighted more than precision)."""
+    if len(np.unique(labels)) < 2:
+        return 0.5
+    
+    precision, recall, thresholds = precision_recall_curve(labels, probs)
+    # F2 = (5 * P * R) / (4 * P + R)
+    f2_scores = (5 * precision * recall) / (4 * precision + recall + 1e-8)
+    best_idx = np.argmax(f2_scores)
+    return float(thresholds[best_idx])
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +142,8 @@ def main():
     # train.py. Do NOT refit — different random state breaks model calibration.
     # No weather scaler: pipeline already produces Z-scored weather features.
     a_sc = joblib.load(os.path.join(MODEL_DIR, "agro_scaler.pkl"))
+    T    = joblib.load(os.path.join(MODEL_DIR, "temperature.pkl"))
+    print(f"Loaded temperature T = {T:.4f}")
 
     # ── Load dataset and apply warmup filter ─────────────────────────────────
     df = pd.read_csv(os.path.join(DATA_DIR, "v11_features.csv"))
@@ -132,6 +152,17 @@ def main():
     n_before = len(df)
     df = df[df["warmup_mask"] == 0].reset_index(drop=True)
     print(f"Dropped {n_before - len(df)} warm-up rows. Remaining: {len(df)}")
+
+    # ── Assign labels (v2) ──────────────────────────────────────────────────
+    # risk_label is NOT stored in the CSV — it is computed at runtime by
+    # assign_causal_labels_v2, exactly as train.py does. The CSV on disk
+    # predates this integration and does not contain the column.
+    if not os.path.exists(GT_PATH):
+        raise FileNotFoundError(
+            f"GT file not found: {GT_PATH}\n"
+            "Check that sangli_gt_v2.csv exists in the outbreak_events directory."
+        )
+    df = assign_labels(df, gt_path=GT_PATH)
 
     gt_df = pd.read_csv(GT_PATH)
     gt_df["peak_start"] = pd.to_datetime(gt_df["peak_start"])
@@ -178,7 +209,8 @@ def main():
         for start in range(0, len(X_w_np), BATCH_SIZE):
             bw = torch.FloatTensor(X_w_np[start : start + BATCH_SIZE]).to(device)
             ba = torch.FloatTensor(X_a_np[start : start + BATCH_SIZE]).to(device)
-            _, probs, _ = model(bw, ba)
+            logits, _, _ = model(bw, ba)
+            probs = torch.sigmoid(logits / T)
             all_probs.extend(probs.cpu().numpy().flatten())
 
     all_probs = np.array(all_probs, dtype=np.float32)   # (N,) — aligned with dates
@@ -188,21 +220,20 @@ def main():
     # alignment between keys and all_probs.
     scores_dict = dict(zip(dates, all_probs))
 
-    # ── Threshold calibration on val set ─────────────────────────────────────
-    # Use the dates list (not df queries) for label alignment — the dates list
-    # skips the first seq_len rows of each subset, while a df query does not.
+    # Shifting windows: Val set now includes wetter 2019-2021 period.
     val_mask_arr  = np.array([2019 <= d.year <= 2021 for d in dates])
     val_probs     = all_probs[val_mask_arr]
     val_labels    = label_arr[val_mask_arr]
+    
+    val_ap  = average_precision_score(val_labels, val_probs)
+    opt_thr = find_optimal_threshold(val_probs, val_labels)
 
-    opt_thr = find_threshold_at_fpr(val_probs, val_labels, max_fpr=0.05, fallback=0.5)
-
-    print(f"\n[ CALIBRATION ]")
-    print(f"  Target FPR        : ≤ 5%  (calibrated on Val set 2019-2021)")
-    print(f"  Operating threshold: {opt_thr:.4f}")
+    print(f"\n[ PERFORMANCE ]")
+    print(f"  Val AP (2019-2021): {val_ap:.4f}")
+    print(f"  Optimal threshold  : {opt_thr:.4f} (max F2 on Val)")
 
     # ── Event-level validation across all years ───────────────────────────────
-    print("\n[ EVENT-LEVEL VALIDATION — ALL YEARS ]")
+    print("\n[ EVENT-LEVEL VALIDATION - ALL YEARS ]")
     print(
         f"  NOTE: Train detections are IN-SAMPLE (memorisation check).\n"
         f"        Val detections are OUT-OF-SAMPLE (generalisation metric).\n"
@@ -219,8 +250,12 @@ def main():
         split = "Train" if yr <= 2018 else ("Val" if yr <= 2021 else "Test")
         counts[split][1] += 1
 
-        window_start = peak - timedelta(days=7)
-        window_end   = peak - timedelta(days=3)
+        # Detection window: exactly the actionable label window from
+        # assign_causal_labels_v2 — [peak - LABEL_WINDOW_FAR, peak - LABEL_WINDOW_NEAR].
+        # Using the same constants guarantees the validator only counts alerts
+        # on days that actually carry a risk_label=1.
+        window_start = peak - timedelta(days=LABEL_WINDOW_FAR)
+        window_end   = peak - timedelta(days=LABEL_WINDOW_NEAR)
 
         # Iterate earliest → latest; first hit = maximum lead time
         earliest_alert = None
@@ -251,7 +286,7 @@ def main():
             label = f"  {split:<8}: N/A (0 events in GT)"
         else:
             rate  = det / tot * 100
-            note  = " ← in-sample" if split == "Train" else ""
+            note  = " <- in-sample" if split == "Train" else ""
             label = f"  {split:<8}: {rate:.1f}%  ({det}/{tot}){note}"
         print(label)
 

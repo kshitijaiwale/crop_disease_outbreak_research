@@ -2,10 +2,10 @@
 V11 KG-CTCN Training Pipeline
 --------------------------------------------------
 Implements end-to-end training with composite loss:
-  Loss = BCE (weighted sampler) + 0.5 * Focal + 0.1 * Causal Consistency
+  Loss = BCE (weighted sampler) + 0.5 * Focal
 
 Split: Train(2005-2018), Val(2019-2021), Test(2022-2024)
-Scheduler: CosineAnnealingLR (T_max=80, eta_min=1e-5)
+Scheduler: CosineAnnealingLR (T_max=120, eta_min=1e-5)
 
 CHANGELOG (v11.1):
   - [CRITICAL]  Removed 'RH2M_z90', 'T2M_z90', 'PRECTOTCORR_z90' from
@@ -74,6 +74,21 @@ CHANGELOG (v11.3):
   - [TRAIN]     PIPELINE_VERSION bumped to v11.3.
   - [TRAIN]     augmentation config written to metadata JSON for
                 experiment reproducibility.
+
+CHANGELOG (v11.4):
+  - [BUG]       focal_loss_fn was instantiated but never called. The training
+                loop only used bce_loss_fn, contradicting the docstring and
+                the composite-loss design. Loss is now:
+                  loss = bce_loss_fn(logits, by) + 0.5 * focal_loss_fn(logits, by)
+                The focal term hard-mines on boundary cases; BCE + sampler
+                handle the class-imbalance correction.
+  - [BUG]       Removed redundant model.load_state_dict() before threshold
+                finding (line ~588). The checkpoint was saved moments earlier
+                and no weights changed between the two evaluation steps.
+                The single load before temperature scaling is sufficient.
+  - [BUG]       Stale docstring header corrected: T_max=80 → T_max=120 and
+                loss formula updated to match actual training code.
+  - [TRAIN]     PIPELINE_VERSION bumped to v11.4.
 """
 
 import os
@@ -126,7 +141,7 @@ SEQ_LEN = 28  # TCN receptive field window (days)
 AUGMENT_FACTOR    = 4     # was 7
 AUGMENT_NOISE_STD = 0.15  # was 0.05
 
-PIPELINE_VERSION = "v11.3"
+PIPELINE_VERSION = "v11.4"
 
 # ---------------------------------------------------------------------------
 # Custom losses
@@ -352,9 +367,9 @@ def train():
     X_w, X_a, y, dates = build_sequences(df, SEQ_LEN)
 
     # ── Chronological splits ─────────────────────────────────────────────────
-    train_mask = (dates.year >= 2005) & (dates.year <= 2014)
-    val_mask   = (dates.year >= 2015) & (dates.year <= 2018)
-    test_mask  = (dates.year >= 2019) & (dates.year <= 2021)
+    train_mask = (dates.year >= 2005) & (dates.year <= 2018)
+    val_mask   = (dates.year >= 2019) & (dates.year <= 2021)
+    test_mask  = (dates.year >= 2022) & (dates.year <= 2024)
 
     print(f"Train: {train_mask.sum():>5d} samples  (Pos: {y[train_mask].sum():.0f})")
     print(f"Val:   {val_mask.sum():>5d} samples  (Pos: {y[val_mask].sum():.0f})")
@@ -399,7 +414,12 @@ def train():
         torch.FloatTensor(y[val_mask]).view(-1, 1),
     )
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    class_counts = np.bincount(y_train.astype(int))
+    sample_weights = (1.0 / class_counts)[y_train.astype(int)]
+    sampler = WeightedRandomSampler(
+        torch.DoubleTensor(sample_weights), num_samples=len(y_train), replacement=True
+    )
+    train_loader = DataLoader(train_ds, batch_size=64, sampler=sampler)
     val_loader   = DataLoader(val_ds, batch_size=128, shuffle=False)
 
     # ── Model & optimiser ────────────────────────────────────────────────────
@@ -407,15 +427,17 @@ def train():
     print(f"Device: {device}")
 
     model = KGCTCN(len(WEATHER_FEATURES), len(AGRO_FEATURES)).to(device)
-    pos_weight    = torch.tensor([len(y_train) / y_train.sum() / 4])
-    bce_loss_fn   = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    
+    # Loss functions
+    bce_loss_fn   = nn.BCEWithLogitsLoss()
+    focal_loss_fn = FocalLoss(alpha=1.0, gamma=2.0)
     optimizer     = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-3)
     scheduler     = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=120, eta_min=1e-5
     )
 
     # ── Training loop ────────────────────────────────────────────────────────
-    best_val_ap = 0.0
+    best_val_loss = float("inf")
     print("\nStarting training...")
     print(f"{'Epoch':>6}  {'Train loss':>11}  {'Val loss':>9}  {'Val AP':>7}  {'LR':>9}")
     print("-" * 54)
@@ -430,8 +452,9 @@ def train():
 
             logits, probs, _ = model(bw, ba)
 
-            bce    = bce_loss_fn(logits, by)
-            loss = bce
+            # Composite loss: BCE handles class balance (via sampler);
+            # Focal adds hard-example mining on outbreak boundary cases.
+            loss = bce_loss_fn(logits, by) + 0.5 * focal_loss_fn(logits, by)
             loss.backward()
 
             # Clip gradients — prevents NaN/Inf weights if any boundary NaN
@@ -462,6 +485,8 @@ def train():
             for bw, ba, by in val_loader:
                 bw, ba, by = bw.to(device), ba.to(device), by.to(device)
                 logits, probs, _ = model(bw, ba)
+                
+                # Validation loss match
                 val_loss_sum += bce_loss_fn(logits, by).item()
                 val_preds.extend(probs.cpu().numpy().flatten())
                 val_y.extend(by.cpu().numpy().flatten())
@@ -484,15 +509,15 @@ def train():
         if epoch % 5 == 0:
             print(f"{epoch:>6}  {mean_train_loss:>11.4f}  {mean_val_loss:>9.4f}  {val_ap:>7.4f}  {current_lr:>9.2e}")
 
-        if val_ap > best_val_ap:
-            best_val_ap = val_ap
+        if mean_val_loss < best_val_loss:
+            best_val_loss = mean_val_loss
             torch.save(
                 model.state_dict(),
                 os.path.join(MODEL_DIR, "v11_kg_ctcn.pth"),
             )
 
     print("\nTraining complete.")
-    print(f"Best Val AP: {best_val_ap:.4f}")
+    print(f"Best Val Loss: {best_val_loss:.4f}")
 
     # ── Save metadata (JSON) ─────────────────────────────────────────────────
     metadata = {
@@ -507,9 +532,10 @@ def train():
             "noise_features": _NOISE_FEATURE_NAMES,
         },
         "loss_weights": {"bce": 1.0},
-        "train_years": [2005, 2014],
-        "val_years": [2015, 2018],
-        "test_years": [2019, 2021],
+        "sampler": "WeightedRandomSampler",
+        "train_years": [2005, 2018],
+        "val_years": [2019, 2021],
+        "test_years": [2022, 2024],
     }
     meta_path = os.path.join(MODEL_DIR, "v11_metadata.json")
     with open(meta_path, "w") as f:
@@ -574,9 +600,9 @@ def train():
     print(f"  Temperature saved to models/temperature.pkl")
 
     # ── Optimal Threshold Finding (Val Set) ──────────────────────────────────
+    # model is already loaded (best checkpoint) and in eval mode from the
+    # temperature scaling step above — no need to reload weights here.
     print("\nFinding optimal threshold on validation set (max F2)...")
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "v11_kg_ctcn.pth")))
-    model.eval()
 
     val_ds = TensorDataset(
         torch.FloatTensor(X_w[val_mask]),
@@ -629,28 +655,38 @@ def train():
 
     test_preds_arr = np.array(test_preds)
     test_y_arr     = np.array(test_y)
-
-    test_ap  = average_precision_score(test_y_arr, test_preds_arr)
-    test_auc = roc_auc_score(test_y_arr, test_preds_arr)
-
-    # Re-calculate P/R curve on test
-    test_precision, test_recall, test_thresholds = precision_recall_curve(test_y_arr, test_preds_arr)
-
-    # Use optimal_threshold from Val
-    t_idx = np.argmin(np.abs(test_thresholds - optimal_threshold))
-    p_at_opt = test_precision[t_idx]
-    r_at_opt = test_recall[t_idx]
-
-    print(f"\n── Test Set Evaluation ──────────────────────────────")
-    print(f"  Test AP:               {test_ap:.4f}")
-    print(f"  Test AUC-ROC:          {test_auc:.4f}")
-    print(f"  Positives in test:     {int(test_y_arr.sum())} / {len(test_y_arr)}")
-    print(f"  At optimal threshold {optimal_threshold:.4f}:")
-    print(f"    Precision:           {p_at_opt:.3f}")
-    print(f"    Recall:              {r_at_opt:.3f}")
-    print(f"    Meaning: of alerts fired, {p_at_opt:.0%} were true pre-outbreak windows")
-    print(f"             {r_at_opt:.0%} of actual pre-outbreak windows were caught")
-
+ 
+    if test_y_arr.sum() > 0:
+        test_ap  = average_precision_score(test_y_arr, test_preds_arr)
+        test_auc = roc_auc_score(test_y_arr, test_preds_arr)
+ 
+        # Re-calculate P/R curve on test
+        test_precision, test_recall, test_thresholds = precision_recall_curve(test_y_arr, test_preds_arr)
+ 
+        # Use optimal_threshold from Val
+        t_idx = np.argmin(np.abs(test_thresholds - optimal_threshold))
+        p_at_opt = test_precision[t_idx]
+        r_at_opt = test_recall[t_idx]
+ 
+        print(f"\n-- Test Set Evaluation --")
+        print(f"  Test AP:               {test_ap:.4f}")
+        print(f"  Test AUC-ROC:          {test_auc:.4f}")
+        print(f"  Positives in test:     {int(test_y_arr.sum())} / {len(test_y_arr)}")
+        print(f"  At optimal threshold {optimal_threshold:.4f}:")
+        print(f"    Precision:           {p_at_opt:.3f}")
+        print(f"    Recall:              {r_at_opt:.3f}")
+        
+        # What threshold actually captures something on test?
+        for i, (p, r, t) in enumerate(zip(test_precision, test_recall, test_thresholds)):
+            if r >= 0.5:
+                print(f"\nFirst test threshold with recall >= 0.5: {t:.4f}")
+                print(f"  Precision at that point: {p:.4f}")
+                break
+    else:
+        print(f"\n-- Test Set Evaluation --")
+        print(f"  Positives in test:     0 / {len(test_y_arr)}")
+        print(f"  (Skipping AP/AUC calculation as test set has no positive samples)")
+ 
     print("\nTest score distribution:")
     print(f"  Max:    {test_preds_arr.max():.4f}")
     print(f"  Mean:   {test_preds_arr.mean():.4f}")
@@ -658,13 +694,6 @@ def train():
     print(f"  >0.05:  {(test_preds_arr > 0.05).sum()}")
     print(f"  >0.1:   {(test_preds_arr > 0.1).sum()}")
     print(f"  >0.2:   {(test_preds_arr > 0.2).sum()}")
-
-    # What threshold actually captures something on test?
-    for i, (p, r, t) in enumerate(zip(test_precision, test_recall, test_thresholds)):
-        if r >= 0.5:
-            print(f"\nFirst test threshold with recall >= 0.5: {t:.4f}")
-            print(f"  Precision at that point: {p:.4f}")
-            break
 
 
 if __name__ == "__main__":

@@ -36,6 +36,13 @@ CHANGELOG (v11.1):
                 of printing directly. The caller (main() or any other consumer)
                 decides how to render it. This makes the function testable and
                 usable in API / dashboard contexts.
+
+CHANGELOG (v11.2):
+  - [BUG]       main() fallback for missing target_date referenced
+                df["risk_label"] which does not exist in v11_features.csv
+                (risk_label is computed at runtime, not persisted). The fallback
+                now calls assign_labels() from assign_causal_labels_v2 to
+                derive labels on the fly, then selects the first positive date.
 """
 
 import os
@@ -230,8 +237,25 @@ def main():
     # ── Select target date ───────────────────────────────────────────────────
     target_date = pd.to_datetime("2019-06-20")
     if target_date not in df["date"].values:
-        # Fall back to the first known risk-positive day in the dataset
-        target_date = df[df["risk_label"] == 1]["date"].iloc[0]
+        # risk_label is NOT stored in v11_features.csv — it is computed at
+        # runtime. Assign labels now so we can find the first positive day.
+        import json as _json
+        _meta_path = os.path.join(MODEL_DIR, "v11_metadata.json")
+        with open(_meta_path) as _f:
+            _meta = _json.load(_f)
+        _gt_path = os.path.join(
+            os.path.dirname(BASE_DIR),
+            "research_comp", "evidence_base", "outbreak_events", "sangli_gt_v2.csv",
+        )
+        from assign_causal_labels_v2 import assign_labels
+        _df_labeled = assign_labels(df, gt_path=_gt_path)
+        pos_rows = _df_labeled[_df_labeled["risk_label"] == 1]
+        if pos_rows.empty:
+            raise ValueError(
+                "Target date not found and no risk_label=1 rows exist after labeling. "
+                "Check that sangli_gt_v2.csv covers the loaded date range."
+            )
+        target_date = pos_rows["date"].iloc[0]
         print(f"Target date not found; using first risk-positive day: {target_date.date()}")
 
     idx = df[df["date"] == target_date].index[0]

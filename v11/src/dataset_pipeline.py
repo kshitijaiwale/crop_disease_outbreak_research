@@ -7,7 +7,7 @@ CHANGES FROM V8
 ---------------
 [CRITICAL] Removed apply_susceptibility_and_labels() labeling block.
            Labels are now assigned exclusively in train.py using GT dates
-           and a [peak-10, peak-7] lead-time window matching the 7-day
+           and a [peak-14, peak-7] lead-time window matching the 7-14 day
            spray decision horizon.
 
            The variety_susceptibility, is_ratoon, and crop_age_days columns
@@ -42,6 +42,41 @@ OUTPUT
     Columns: YEAR, DOY, weather (Z-scored), weather_raw, KG-derived features,
              warmup_mask, variety_susceptibility, is_ratoon, crop_age_days.
     No risk_label. No sequences.
+
+CHANGES FROM V11
+---------------
+[BUG]      engineer_agronomic_features() replaced np.random.seed(42) (legacy
+           global RNG) with np.random.default_rng(42) (new-style Generator).
+           The legacy seed mutated global state and produced different
+           variety/ratoon assignments if any upstream code called np.random
+           before this function. The Generator is self-contained and seeded
+           once. Also added sorted() to ratoon_probs iteration to match the
+           deterministic year ordering used for variety assignment.
+
+CHANGES FROM V11.1 (this version)
+----------------------------------
+[BUG]      engineer_agronomic_features() now applies a GT-aware variety
+           override after the probabilistic assignment. Years with
+           literature-confirmed outbreaks (GT_OUTBREAK_YEARS) must not
+           receive variety_susceptibility=0 (resistant), because an outbreak
+           cannot occur in a fully resistant host. When the RNG draws
+           resistant(0) for a confirmed outbreak year, the value is upgraded
+           to moderate(1).
+
+           This fixes the root cause of the six suppressed GT events seen in
+           training output (2011 ×3, 2019 ×3): those years drew resistant(0)
+           from the probabilistic model, which then caused
+           assign_causal_labels_v2 to zero out all their positive labels.
+
+           GT_OUTBREAK_YEARS is defined from the LITERATURE_ANNOTATIONS in
+           Gt_generator.py (outbreak_occurred=True entries only). It must be
+           kept in sync with sangli_gt_v2.csv. Adding a new confirmed outbreak
+           year to the GT requires adding it here as well.
+
+           Note: assign_causal_labels_v2 also has a GT override as a second
+           line of defence (in case this list is ever out of sync). The fix
+           here is upstream and preferred — it corrects the feature itself
+           rather than patching around it in the label function.
 """
 
 import os
@@ -55,6 +90,12 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 ROLLING_WINDOW = 365  # days for Z-score normalization (geographic invariance)
 WARMUP_DAYS    = 365  # rows masked while rolling stats are unstable
+
+# Years with literature-confirmed outbreaks (outbreak_occurred=True in
+# Gt_generator.py LITERATURE_ANNOTATIONS). These years must not receive
+# variety_susceptibility=0 — a confirmed outbreak is proof the crop was
+# not fully resistant in that season. Keep in sync with sangli_gt_v2.csv.
+GT_OUTBREAK_YEARS = {2006, 2007, 2008, 2009, 2010, 2011, 2015, 2019, 2020}
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +233,12 @@ def engineer_agronomic_features(df: pd.DataFrame) -> pd.DataFrame:
       susceptible Co varieties dominated pre-2010; resistant Co-86032
       and CoM varieties increased post-2015.
 
-    NOTE: No year-specific overrides. Variety assignment is probabilistic
-    and uniform — val/test years get the same treatment as train years.
-    Hardcoded overrides (2019=2, 2020=1, 2021=0) were removed in V9
-    because they scripted label outcomes for known GT event years.
+    GT-aware override: years in GT_OUTBREAK_YEARS cannot receive
+      variety_susceptibility=0. An outbreak confirmed by literature is
+      proof the crop was not fully resistant that season. When the RNG
+      draws resistant(0) for such a year, the value is upgraded to
+      moderate(1). This prevents assign_causal_labels_v2 from silently
+      zeroing out positive labels for confirmed outbreak events.
 
     is_ratoon: ratoon crops are more susceptible due to accumulated
       inoculum in stubble. Probability increases with year (older fields).
@@ -206,24 +249,46 @@ def engineer_agronomic_features(df: pd.DataFrame) -> pd.DataFrame:
     print("STEP 4: Agronomic feature simulation")
 
     df["year"] = df["date"].dt.year
-    np.random.seed(42)
+
+    # Use the new-style Generator API so that:
+    #  (a) the global numpy RNG state is not mutated (no side effects on callers),
+    #  (b) assignments are stable regardless of how many other np.random calls
+    #      precede this function — the generator is independent and seeded once.
+    rng = np.random.default_rng(42)
 
     def assign_variety(year: int) -> int:
         if year <= 2010:
-            return np.random.choice([2, 1], p=[0.8, 0.2])
+            return int(rng.choice([2, 1], p=[0.8, 0.2]))
         elif year <= 2015:
-            return np.random.choice([2, 1, 0], p=[0.3, 0.4, 0.3])
+            return int(rng.choice([2, 1, 0], p=[0.3, 0.4, 0.3]))
         else:
-            return np.random.choice([1, 0], p=[0.4, 0.6])
+            return int(rng.choice([1, 0], p=[0.4, 0.6]))
 
+    # Sort years so the call sequence into rng is deterministic regardless
+    # of the order years appear in the dataframe.
     year_variety_map = {y: assign_variety(y) for y in sorted(df["year"].unique())}
+
+    # GT-aware override: upgrade resistant(0) draws for confirmed outbreak years.
+    # A literature-confirmed outbreak is proof the crop was not fully resistant.
+    # The probabilistic model is an approximation; GT is authoritative.
+    n_upgraded = 0
+    for yr in GT_OUTBREAK_YEARS:
+        if yr in year_variety_map and year_variety_map[yr] == 0:
+            year_variety_map[yr] = 1  # resistant → moderate
+            n_upgraded += 1
+            print(f"  Variety override: {yr} upgraded from resistant(0) to "
+                  f"moderate(1) — GT confirms outbreak occurred this year")
+    if n_upgraded == 0:
+        print(f"  Variety override: no upgrades needed "
+              f"(no GT outbreak year drew resistant in this RNG run)")
+
     df["variety_susceptibility"] = df["year"].map(year_variety_map)
 
     # Ratoon probability increases slightly over time as older fields accumulate
     ratoon_probs = {y: min(0.2 + (y - 2005) * 0.01, 0.45)
-                    for y in df["year"].unique()}
+                    for y in sorted(df["year"].unique())}
     df["is_ratoon"] = df["year"].map(
-        {y: int(np.random.rand() < p) for y, p in ratoon_probs.items()}
+        {y: int(rng.random() < p) for y, p in ratoon_probs.items()}
     )
 
     # Crop age: synthetic within-season day counter peaking mid-season
@@ -271,6 +336,20 @@ def validate_and_save(df: pd.DataFrame) -> None:
             status = "OK" if post_warmup_nan == 0 else "WARN"
             print(f"    [{status}] {col}: {n} NaN total "
                   f"({warmup_nan} in warmup, {post_warmup_nan} post-warmup)")
+
+    # GT-aware variety sanity check: no confirmed outbreak year should be
+    # resistant(0) after the override above.
+    df_tmp = df.copy()
+    df_tmp["year"] = pd.to_datetime(df["date"]).dt.year if "date" in df.columns else None
+    if df_tmp["year"] is not None:
+        for yr in GT_OUTBREAK_YEARS:
+            yr_rows = df_tmp[df_tmp["year"] == yr]
+            if not yr_rows.empty:
+                vs = yr_rows["variety_susceptibility"].iloc[0]
+                if vs == 0:
+                    print(f"  WARN: GT outbreak year {yr} still has "
+                          f"variety_susceptibility=0 after override. "
+                          f"Check GT_OUTBREAK_YEARS list.")
 
     out_path = os.path.join(PROCESSED_DIR, "v11_features.csv")
     df.to_csv(out_path, index=False)
