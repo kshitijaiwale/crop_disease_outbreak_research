@@ -28,6 +28,8 @@ REGION_DEFAULTS = {
 class DeploymentAPI:
     def __init__(self):
         print("Initializing V11 Inference Engine...")
+        from feedback_db import init_db
+        init_db()
         self.engine = V11InferenceEngine()
         
     def _get_agronomic_inputs(self, location, farmer_inputs):
@@ -102,7 +104,12 @@ class DeploymentAPI:
         # 3. Explainability
         explanation_text, advisory_text = self._generate_explanation(inf_out)
         
-        # 4. Feedback Logging
+        # 4. Alert Orchestration (Event Clustering)
+        alert_result = evaluate_alert_state(location, target_date, inf_out["risk_class"])
+        alert_state   = alert_result["status"]
+        alert_message = alert_result["message"]
+        
+        # 5. Feedback Logging (Offline Retraining & Audit)
         log_prediction(
             pred_id=pred_id,
             target_date=target_date,
@@ -111,13 +118,9 @@ class DeploymentAPI:
             agro_inputs=agro_inputs,
             risk_score=inf_out["risk_score"],
             risk_class=inf_out["risk_class"],
-            confidence=inf_out["confidence_score"]
+            confidence=inf_out["confidence_score"],
+            alert_status=alert_state
         )
-        
-        # 5. Alert Orchestration (Event Clustering)
-        alert_result = evaluate_alert_state(location, target_date, inf_out["risk_class"])
-        alert_state   = alert_result["status"]
-        alert_message = alert_result["message"]
         
         # 6. Output Construction
         status_msg = alert_message

@@ -14,13 +14,16 @@ from contextlib import asynccontextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from deployment_layer import DeploymentAPI
-from feedback_db import submit_feedback
+from feedback_db import submit_feedback, init_db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize the deployment API (loads frozen model and scalers) on startup.
     # This prevents the app from starting if model files are missing, but
     # avoids global import-time crashes and ensures thread-safe access via state.
+    print("Initializing Feedback Database...")
+    init_db()
+    
     print("Loading V11 Model and Scalers...")
     try:
         app.state.deployment_api = DeploymentAPI()

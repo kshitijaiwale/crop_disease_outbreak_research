@@ -123,34 +123,12 @@ def _get_connection() -> sqlite3.Connection:
 def init_alert_db() -> None:
     """
     Create the predictions table if it does not already exist.
-
-    Schema:
-      id              INTEGER PRIMARY KEY AUTOINCREMENT
-      location        TEXT     — farm/region identifier
-      prediction_date TEXT     — ISO date the model ran (YYYY-MM-DD)
-      target_date     TEXT     — ISO date of predicted outbreak window
-      risk_class      TEXT     — "Low" | "Medium" | "High"
-      risk_score      REAL     — raw sigmoid probability [0, 1]
-      alert_status    TEXT     — status string from ALERT_CONFIG
-      created_at      TEXT     — ISO datetime of record insertion
-
-    Indices:
-      idx_predictions_lookup — covers the (location, prediction_date) query
-      used by evaluate_alert_state() for the consecutive-day check.
+    Aligned with feedback_db.py to ensure a unified schema.
     """
+    from feedback_db import init_db
+    init_db()
+    
     with contextlib.closing(_get_connection()) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS predictions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                location        TEXT    NOT NULL,
-                prediction_date TEXT    NOT NULL,
-                target_date     TEXT    NOT NULL,
-                risk_class      TEXT    NOT NULL,
-                risk_score      REAL    NOT NULL,
-                alert_status    TEXT,
-                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_predictions_lookup
             ON predictions (location, prediction_date)
@@ -187,6 +165,7 @@ def _fetch_yesterday_risk(location: str, yesterday_date) -> str:
 
 
 def log_prediction(
+    prediction_id: str,
     location: str,
     prediction_date,
     target_date,
@@ -196,18 +175,17 @@ def log_prediction(
 ) -> None:
     """
     Insert a prediction record into the predictions table.
-
-    Call this after evaluate_alert_state() so the alert_status is persisted
-    alongside the prediction for audit and consecutive-day lookups.
+    Aligned with feedback_db.py schema.
     """
     with contextlib.closing(_get_connection()) as conn:
         conn.execute(
             """
             INSERT INTO predictions
-                (location, prediction_date, target_date, risk_class, risk_score, alert_status)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (prediction_id, location, prediction_date, target_date, risk_class, risk_score, alert_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                prediction_id,
                 location,
                 str(pd.to_datetime(prediction_date).date()),
                 str(pd.to_datetime(target_date).date()),
