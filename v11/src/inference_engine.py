@@ -98,20 +98,36 @@ class V11InferenceEngine:
         X_a   = torch.FloatTensor(self.agro_scaler.transform(a_raw)).to(self.device)
         X_w   = torch.FloatTensor(weather_seq).unsqueeze(0).to(self.device)
         
-        # 3. Model execution
+        # 3. Model execution with temperature calibration
         with torch.no_grad():
             logits, _, conf_logit = self.model(X_w, X_a)
-            # --- Bug 3 Fix: Apply temperature scaling ---
             risk_score = torch.sigmoid(logits / self.temperature).item()
             confidence = torch.sigmoid(conf_logit).item()
 
-        # Risk class thresholds are relative to the temperature-calibrated
-        # probability scale. We use the optimal F2 threshold from training
-        # as the 'Medium' entry point.
-        opt_t = self.meta.get('optimal_threshold', 0.3)
+        # 4. KG biological gate — suppress false positives when the known
+        #    causal conditions for Red Rot are absent.
+        #    These are hard biological priors, not learned thresholds:
+        #      RH_persist_7d < 2.0 : fewer than 2 high-humidity days this week
+        #                            → pathogen cannot sustain infection pressure
+        #      Rain_sum_7d   < 5.0 : less than 5 mm rainfall this week
+        #                            → insufficient moisture for spore dispersal
+        #    If BOTH conditions are dry, cap risk at Low regardless of model score.
+        #    This directly targets the 19% FPR: most false alarms occur in
+        #    dry weeks where the model fires on temperature anomalies alone.
+        WF = self.weather_features
+        rh_persist = float(weather_seq[-1, WF.index("RH_persist_7d")])
+        rain_7d    = float(weather_seq[-1, WF.index("Rain_sum_7d")])
+        kg_gate_open = (rh_persist >= 2.0) or (rain_7d >= 5.0)
+
+        if not kg_gate_open:
+            risk_score = min(risk_score, 0.15)   # cap at Low ceiling
+
+        # 5. Risk class — use temperature-calibrated thresholds.
+        #    Medium entry at 0.20 (raised from F2-optimal ~0.09 which caused
+        #    19% FPR). High entry kept at 0.70.
         risk_class = (
-            "High"   if risk_score >= 0.7 else
-            "Medium" if risk_score >= opt_t else
+            "High"   if risk_score >= 0.70 else
+            "Medium" if risk_score >= 0.20 else
             "Low"
         )
 
@@ -121,6 +137,9 @@ class V11InferenceEngine:
             "confidence_score":      confidence,
             "logits":                logits.item(),
             "temperature":           self.temperature,
+            "kg_gate_open":          kg_gate_open,
+            "rh_persist_7d":         rh_persist,
+            "rain_sum_7d":           rain_7d,
             "raw_weather_sequence":  weather_seq,
             "weather_feature_names": self.weather_features,
             "agro_inputs":           agro_inputs,

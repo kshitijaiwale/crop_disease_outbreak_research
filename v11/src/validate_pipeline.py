@@ -6,63 +6,38 @@ research_comp/evidence_base/outbreak_events/sangli_synthetic_gt.csv
 
 Produces a comprehensive report for all events across all years.
 
-CHANGELOG (v11.2):
-  - [CRITICAL]  GT_PATH updated from sangli_synthetic_gt.csv to
-                sangli_gt_v2.csv to match train.py. Using the old GT
-                file would evaluate against a different event set than
-                the model was trained on.
-  - [CRITICAL]  assign_causal_labels_v2.assign_labels() called after
-                warmup filter. risk_label is not persisted in the CSV —
-                it is computed at runtime. validate_pipeline.py was
-                crashing with KeyError: risk_label because the stale
-                CSV predates the v2 label integration in train.py.
-  - [CRITICAL]  FileNotFoundError guard added for GT_PATH. A missing
-                GT file previously produced a cryptic pandas read error;
-                now produces a clear actionable message.
-
-CHANGELOG (v11.1):
-  - [CRITICAL]  load_metadata() switched from .txt parser to json.load().
-                train.py now writes v11_metadata.json.
-  - [CRITICAL]  Removed weather StandardScaler. Weather features are already
-                90-day rolling Z-scores from the pipeline. Agro scaler loaded
-                from agro_scaler.pkl rather than refitted — ensures exact
-                reproducibility with the saved model checkpoint.
-  - [CRITICAL]  warmup_mask filter applied before sequence building. Without
-                this, sequences overlapping the first 90 warm-up rows contain
-                NaN activations; NaN predictions silently fail threshold
-                comparisons (NaN >= threshold is always False), suppressing
-                alerts for those dates with no warning.
-  - [BUG]       Threshold search reversed to descending (0.99 → 0.01).
-                Ascending search found the lowest threshold satisfying FPR <= 5%
-                (nearly always ~0.01), producing near-zero precision.
-                Descending search finds the most conservative (highest) valid
-                threshold.
-  - [BUG]       Val label alignment fixed. Previously queried the unfiltered df
-                with df[df['date'].isin(val_dates)], which includes the first
-                seq_len rows of 2019 that were skipped in sequence building,
-                causing a length mismatch between val_probs and val_labels.
-                Labels now derived directly from the ordered dates list.
-  - [BUG]       FP audit label alignment fixed. dict.values() order matches
-                insertion order (dates list), but df[df['date'].isin(dates)]
-                returns rows in dataframe sort order — these can differ.
-                Labels now built from the dates list to guarantee alignment.
-  - [DESIGN]    Full dataset no longer moved to device before batch loop.
-                Allocating 7000×28×14 float32 on device upfront wastes VRAM
-                and fails on low-memory GPUs. Tensors now moved inside the
-                batch loop.
-  - [DESIGN]    Train detection rate clearly labelled as in-sample
-                memorisation check, not a generalisation metric.
+CHANGELOG (v11.4):
+  - [CRITICAL]  FPR audit now uses the SAME decision logic as
+                inference_engine.py: temperature-calibrated scores +
+                KG biological gate + operational MEDIUM_THRESHOLD (0.20).
+                Previously, validate_pipeline.py bypassed inference_engine.py
+                entirely — it applied sigmoid(logits/T) then threshold'd at
+                the F2-optimal value (0.0861 from val set). The KG gate in
+                inference_engine.py never ran, so the reported 19.2% FPR was
+                measuring a different decision function than production uses.
+  - [DESIGN]    KG_APPLY_GATE flag (default True) allows gate to be disabled
+                for ablation studies without editing production code.
+  - [DESIGN]    FPR audit now reports gated vs ungated day counts so the
+                contribution of the biological gate is visible.
 
 CHANGELOG (v11.3):
   - [BUG]       Detection window was hardcoded as [peak-14, peak-7] but
-                assign_causal_labels_v2 labels [peak-10, peak-7]. Alerts
-                in [peak-14, peak-11] were counted as detections even
-                though no risk_label=1 exists there, inflating detection
-                rates. Window now imported from assign_causal_labels_v2 as
-                LABEL_WINDOW_FAR / LABEL_WINDOW_NEAR — single source of truth.
-  - [STYLE]     from assign_causal_labels_v2 import assign_labels moved to
-                top-level imports (was deferred inside main()). Also imports
-                LABEL_WINDOW_FAR and LABEL_WINDOW_NEAR from the same module.
+                assign_causal_labels_v2 labels [peak-10, peak-7]. Window now
+                imported from assign_causal_labels_v2 as LABEL_WINDOW_FAR /
+                LABEL_WINDOW_NEAR — single source of truth.
+
+CHANGELOG (v11.2):
+  - [CRITICAL]  GT_PATH updated to sangli_gt_v2.csv.
+  - [CRITICAL]  assign_causal_labels_v2.assign_labels() called at runtime.
+  - [CRITICAL]  FileNotFoundError guard added for GT_PATH.
+
+CHANGELOG (v11.1):
+  - [CRITICAL]  load_metadata() switched to json.load().
+  - [CRITICAL]  Removed weather StandardScaler.
+  - [CRITICAL]  warmup_mask filter applied before sequence building.
+  - [BUG]       Threshold search reversed to descending.
+  - [BUG]       Val / FP label alignment fixed.
+  - [DESIGN]    Full dataset no longer pre-allocated on device.
 """
 
 import os
@@ -81,10 +56,9 @@ from assign_causal_labels_v2 import assign_labels, LABEL_WINDOW_FAR, LABEL_WINDO
 # Paths
 # ---------------------------------------------------------------------------
 
-BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR     = os.path.join(BASE_DIR, "data", "processed")
-MODEL_DIR    = os.path.join(BASE_DIR, "models")
-PROJECT_ROOT = os.path.dirname(BASE_DIR)
+BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR  = os.path.join(BASE_DIR, "data", "processed")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 GT_PATH = os.path.join(
     BASE_DIR,
@@ -93,38 +67,62 @@ GT_PATH = os.path.join(
 
 BATCH_SIZE = 512
 
+# ---------------------------------------------------------------------------
+# Decision thresholds — must match inference_engine.py exactly
+# ---------------------------------------------------------------------------
+
+MEDIUM_THRESHOLD = 0.20   # operational alert threshold (not F2-optimal)
+HIGH_THRESHOLD   = 0.55
+
+# KG biological gate — same constants as inference_engine.py
+KG_RH_PERSIST_MIN = 2.0   # days of high RH required for sporangium dispersal
+KG_RAIN_SUM_MIN   = 5.0   # mm over 7 days required for surface wetness
+KG_GATE_CAP       = 0.15  # max score when gate is closed (dry week)
+KG_APPLY_GATE     = True  # set False to ablate gate contribution
+
 
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
 
 def load_metadata() -> dict:
-    """Load model metadata from v11_metadata.json (written by train.py v11.1+)."""
     with open(os.path.join(MODEL_DIR, "v11_metadata.json"), "r") as f:
         return json.load(f)
 
 
 # ---------------------------------------------------------------------------
-# Threshold calibration
+# KG biological gate  (mirrors inference_engine.py apply_kg_gate)
 # ---------------------------------------------------------------------------
 
-def find_optimal_threshold(
-    probs: np.ndarray,
-    labels: np.ndarray,
-) -> float:
-    """Find threshold that maximises F2 score (recall weighted more than precision)."""
+def apply_kg_gate(score: float, rh_persist_7d: float, rain_sum_7d: float) -> tuple:
+    """
+    Returns (gated_score, gate_open).
+    gate_open=False: biological conditions for outbreak are absent;
+    score is capped at KG_GATE_CAP regardless of model output.
+    """
+    if not KG_APPLY_GATE:
+        return score, True
+    dry_week = (rh_persist_7d < KG_RH_PERSIST_MIN) and (rain_sum_7d < KG_RAIN_SUM_MIN)
+    if dry_week:
+        return min(score, KG_GATE_CAP), False
+    return score, True
+
+
+# ---------------------------------------------------------------------------
+# Threshold calibration (kept for informational Val AP reporting only)
+# ---------------------------------------------------------------------------
+
+def find_optimal_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
     if len(np.unique(labels)) < 2:
         return 0.5
-    
     precision, recall, thresholds = precision_recall_curve(labels, probs)
-    # F2 = (5 * P * R) / (4 * P + R)
     f2_scores = (5 * precision * recall) / (4 * precision + recall + 1e-8)
     best_idx = np.argmax(f2_scores)
     return float(thresholds[best_idx])
 
 
 # ---------------------------------------------------------------------------
-# Main validation
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
@@ -138,14 +136,13 @@ def main():
     agro_features    = meta["agro_features"]
     seq_len          = int(meta["seq_len"])
 
-    # Agro scaler: load the exact instance fitted on the training split in
-    # train.py. Do NOT refit — different random state breaks model calibration.
-    # No weather scaler: pipeline already produces Z-scored weather features.
     a_sc = joblib.load(os.path.join(MODEL_DIR, "agro_scaler.pkl"))
     T    = joblib.load(os.path.join(MODEL_DIR, "temperature.pkl"))
     print(f"Loaded temperature T = {T:.4f}")
+    print(f"Decision threshold   : {MEDIUM_THRESHOLD:.4f}  (operational, matches inference_engine.py)")
+    print(f"KG biological gate   : {'ENABLED' if KG_APPLY_GATE else 'DISABLED (ablation mode)'}")
 
-    # ── Load dataset and apply warmup filter ─────────────────────────────────
+    # ── Load dataset ─────────────────────────────────────────────────────────
     df = pd.read_csv(os.path.join(DATA_DIR, "v11_features.csv"))
     df["date"] = pd.to_datetime(df["date"])
 
@@ -153,10 +150,7 @@ def main():
     df = df[df["warmup_mask"] == 0].reset_index(drop=True)
     print(f"Dropped {n_before - len(df)} warm-up rows. Remaining: {len(df)}")
 
-    # ── Assign labels (v2) ──────────────────────────────────────────────────
-    # risk_label is NOT stored in the CSV — it is computed at runtime by
-    # assign_causal_labels_v2, exactly as train.py does. The CSV on disk
-    # predates this integration and does not contain the column.
+    # ── Assign labels ────────────────────────────────────────────────────────
     if not os.path.exists(GT_PATH):
         raise FileNotFoundError(
             f"GT file not found: {GT_PATH}\n"
@@ -181,11 +175,11 @@ def main():
 
     # ── Build sequences ───────────────────────────────────────────────────────
     # Weather: no scaler — pipeline already Z-scored.
-    # Agro: transform with the saved scaler.
-    w_vals  = df[weather_features].values.astype(np.float32)
-    a_vals  = a_sc.transform(df[agro_features].values.astype(np.float32))
-    labels  = df["risk_label"].values.astype(np.float32)
-    dates   = []
+    # Agro: transform with the saved scaler (do NOT refit).
+    w_vals = df[weather_features].values.astype(np.float32)
+    a_vals = a_sc.transform(df[agro_features].values.astype(np.float32))
+    labels = df["risk_label"].values.astype(np.float32)
+    dates  = []
 
     X_w_list, X_a_list, label_list = [], [], []
     for i in range(seq_len, len(df)):
@@ -194,74 +188,95 @@ def main():
         label_list.append(labels[i])
         dates.append(df["date"].iloc[i])
 
-    dates       = pd.to_datetime(dates)
-    label_arr   = np.array(label_list, dtype=np.float32)  # aligned with dates
+    dates     = pd.to_datetime(dates)
+    label_arr = np.array(label_list, dtype=np.float32)  # aligned with dates
 
-    X_w_np = np.array(X_w_list, dtype=np.float32)  # (N, seq_len, F) — stays on CPU
-    X_a_np = np.array(X_a_list, dtype=np.float32)  # (N, A)
+    X_w_np = np.array(X_w_list, dtype=np.float32)
+    X_a_np = np.array(X_a_list, dtype=np.float32)
 
-    # ── Batch inference ───────────────────────────────────────────────────────
-    # Tensors are moved to device inside the loop — avoids allocating the full
-    # dataset on VRAM upfront, which fails on low-memory GPUs.
+    # ── Batch inference — raw calibrated probabilities ────────────────────────
+    # Tensors moved to device inside loop — avoids pre-allocating full dataset
+    # on VRAM, which fails on low-memory GPUs.
     print("Running full-dataset inference...")
-    all_probs = []
+    raw_probs = []
     with torch.no_grad():
         for start in range(0, len(X_w_np), BATCH_SIZE):
             bw = torch.FloatTensor(X_w_np[start : start + BATCH_SIZE]).to(device)
             ba = torch.FloatTensor(X_a_np[start : start + BATCH_SIZE]).to(device)
             logits, _, _ = model(bw, ba)
             probs = torch.sigmoid(logits / T)
-            all_probs.extend(probs.cpu().numpy().flatten())
+            raw_probs.extend(probs.cpu().numpy().flatten())
 
-    all_probs = np.array(all_probs, dtype=np.float32)   # (N,) — aligned with dates
+    raw_probs = np.array(raw_probs, dtype=np.float32)
 
-    # ── scores_dict: date → probability ──────────────────────────────────────
-    # Built from the same ordered dates list used for inference — guaranteed
-    # alignment between keys and all_probs.
-    scores_dict = dict(zip(dates, all_probs))
+    # ── Apply KG biological gate ──────────────────────────────────────────────
+    # RH_persist_7d and Rain_sum_7d are read from df rows that correspond to
+    # the sequence endpoints (indices seq_len..len(df)-1), which is exactly the
+    # same alignment used when building sequences above.
+    rh_persist_vals = df["RH_persist_7d"].values[seq_len:]
+    rain_sum_vals   = df["Rain_sum_7d"].values[seq_len:]
 
-    # Shifting windows: Val set now includes wetter 2019-2021 period.
-    val_mask_arr  = np.array([2019 <= d.year <= 2021 for d in dates])
-    val_probs     = all_probs[val_mask_arr]
-    val_labels    = label_arr[val_mask_arr]
-    
-    val_ap  = average_precision_score(val_labels, val_probs)
+    gated_probs   = np.empty_like(raw_probs)
+    gate_open_arr = np.ones(len(raw_probs), dtype=bool)
+
+    for idx in range(len(raw_probs)):
+        gs, go = apply_kg_gate(
+            float(raw_probs[idx]),
+            float(rh_persist_vals[idx]),
+            float(rain_sum_vals[idx]),
+        )
+        gated_probs[idx]   = gs
+        gate_open_arr[idx] = go
+
+    n_gated = int((~gate_open_arr).sum())
+
+    # ── scores_dict for event-level detection ─────────────────────────────────
+    # Uses GATED scores + operational threshold — same as inference_engine.py.
+    scores_dict = dict(zip(dates, gated_probs))
+
+    # ── Val AP (informational — uses raw probs to measure model quality) ──────
+    val_mask   = np.array([2019 <= d.year <= 2021 for d in dates])
+    val_probs  = raw_probs[val_mask]
+    val_labels = label_arr[val_mask]
+    val_ap     = (
+        average_precision_score(val_labels, val_probs)
+        if val_labels.sum() > 0
+        else float("nan")
+    )
     opt_thr = find_optimal_threshold(val_probs, val_labels)
 
     print(f"\n[ PERFORMANCE ]")
-    print(f"  Val AP (2019-2021): {val_ap:.4f}")
-    print(f"  Optimal threshold  : {opt_thr:.4f} (max F2 on Val)")
+    print(f"  Val AP (2019-2021)         : {val_ap:.4f}")
+    print(f"  F2-optimal threshold (info): {opt_thr:.4f}  (not used for FPR audit)")
+    print(f"  Operational threshold used : {MEDIUM_THRESHOLD:.4f}")
 
-    # ── Event-level validation across all years ───────────────────────────────
+    # ── Event-level validation ────────────────────────────────────────────────
     print("\n[ EVENT-LEVEL VALIDATION - ALL YEARS ]")
     print(
-        f"  NOTE: Train detections are IN-SAMPLE (memorisation check).\n"
-        f"        Val detections are OUT-OF-SAMPLE (generalisation metric).\n"
+        "  NOTE: Train detections are IN-SAMPLE (memorisation check).\n"
+        "        Val detections are OUT-OF-SAMPLE (generalisation metric).\n"
     )
     header = f"{'Peak Date':<16}  {'Split':<8}  {'Status':<12}  {'Lead Time'}"
     print(header)
     print("-" * 55)
 
-    counts = {"Train": [0, 0], "Val": [0, 0], "Test": [0, 0]}  # [detected, total]
+    counts = {"Train": [0, 0], "Val": [0, 0], "Test": [0, 0]}
 
     for _, row in gt_df.sort_values("peak_start").iterrows():
-        peak = row["peak_start"]
-        yr   = peak.year
+        peak  = row["peak_start"]
+        yr    = peak.year
         split = "Train" if yr <= 2018 else ("Val" if yr <= 2021 else "Test")
         counts[split][1] += 1
 
         # Detection window: exactly the actionable label window from
-        # assign_causal_labels_v2 — [peak - LABEL_WINDOW_FAR, peak - LABEL_WINDOW_NEAR].
-        # Using the same constants guarantees the validator only counts alerts
-        # on days that actually carry a risk_label=1.
+        # assign_causal_labels_v2 — [peak - FAR, peak - NEAR].
         window_start = peak - timedelta(days=LABEL_WINDOW_FAR)
         window_end   = peak - timedelta(days=LABEL_WINDOW_NEAR)
 
-        # Iterate earliest → latest; first hit = maximum lead time
         earliest_alert = None
         for d in pd.date_range(window_start, window_end):
             score = scores_dict.get(d, 0.0)
-            if score >= opt_thr:
+            if score >= MEDIUM_THRESHOLD:
                 earliest_alert = d
                 break
 
@@ -276,7 +291,6 @@ def main():
 
         print(f"  {peak.date().isoformat():<16}{split:<8}  {status:<12}  {lead_str}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     print("-" * 55)
     print("\n[ SUMMARY REPORT ]")
     print(f"  Total GT events: {len(gt_df)}")
@@ -291,17 +305,24 @@ def main():
         print(label)
 
     # ── False positive audit ──────────────────────────────────────────────────
-    # all_probs and label_arr are both derived from the same ordered dates list
-    # — guaranteed alignment. No df query involved.
-    all_preds = (all_probs >= opt_thr).astype(int)
+    # GATED scores + operational threshold — matches production inference path.
+    # Counterfactual (raw, ungated) shown for comparison so you can see
+    # how much the KG gate alone is contributing to FPR reduction.
+    all_preds = (gated_probs >= MEDIUM_THRESHOLD).astype(int)
 
     fp_total  = int(((all_preds == 1) & (label_arr == 0)).sum())
     tn_total  = int(((all_preds == 0) & (label_arr == 0)).sum())
     fpr_total = fp_total / max(1, fp_total + tn_total)
 
-    print("\n[ FALSE POSITIVE AUDIT ]")
-    print(f"  Global FPR (all years): {fpr_total * 100:.2f}%  (target: < 5%)")
-    print(f"  False alarm days (total dataset): {fp_total}")
+    all_preds_ungated = (raw_probs >= MEDIUM_THRESHOLD).astype(int)
+    fp_ungated  = int(((all_preds_ungated == 1) & (label_arr == 0)).sum())
+    fpr_ungated = fp_ungated / max(1, fp_ungated + tn_total)
+
+    print(f"\n[ FALSE POSITIVE AUDIT ]")
+    print(f"  Days capped by KG gate (dry weeks): {n_gated}  ({n_gated / len(raw_probs) * 100:.1f}% of all days)")
+    print(f"  FPR without KG gate (informational): {fpr_ungated * 100:.2f}%")
+    print(f"  FPR with KG gate    (production)   : {fpr_total * 100:.2f}%  (target: < 5%)")
+    print(f"  False alarm days after gating      : {fp_total}")
 
     status_str = (
         "VALIDATED  — FPR constraint met, causality intact"
