@@ -12,23 +12,35 @@ import torch.nn.functional as F
 class TemporalBlock(nn.Module):
     def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
         super().__init__()
-        padding = (kernel_size - 1) * dilation // 2
-        self.conv = nn.Sequential(
-            nn.Conv1d(n_inputs, n_outputs, kernel_size,
-                      padding=padding, dilation=dilation),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(n_outputs, n_outputs, kernel_size,
-                      padding=padding, dilation=dilation),
-            nn.ReLU(),
-        )
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+
+        self.padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                               padding=0, dilation=dilation)
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                               padding=0, dilation=dilation)
+
+        self.dropout = nn.Dropout(dropout)
         self.relu = nn.ReLU()
 
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+
     def forward(self, x):
-        L = x.size(2)
-        out = self.conv(x)[:, :, :L]
+        x_padded = F.pad(x, (self.padding, 0))
+
+        out = self.conv1(x_padded)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = F.pad(out, (self.padding, 0))
+        out = self.conv2(out)
+        out = self.relu(out)
+
+        # 🔴 CRITICAL: trim to original length
+        out = out[:, :, -x.size(2):]
+
         res = x if self.downsample is None else self.downsample(x)
+
         return self.relu(out + res)
 
 
@@ -110,9 +122,10 @@ class V9TCNModel(nn.Module):
 
 
 if __name__ == "__main__":
-    model = V9TCNModel(weather_features=13, agronomic_features=5)
-    x_w = torch.randn(4, 14, 13)
+    model = V9TCNModel(weather_features=17, agronomic_features=5)
+    x_w = torch.randn(4, 14, 17)
     x_a = torch.randn(4, 5)
     out, attn = model(x_w, x_a)
     print(f"Output : {out.shape}")   # (4, 1)
     print(f"Attn   : {attn.shape}")  # (4, 14, 1)
+

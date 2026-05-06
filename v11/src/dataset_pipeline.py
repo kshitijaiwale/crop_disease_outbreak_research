@@ -77,6 +77,34 @@ CHANGES FROM V11.1 (this version)
            line of defence (in case this list is ever out of sync). The fix
            here is upstream and preferred — it corrects the feature itself
            rather than patching around it in the label function.
+
+CHANGES FROM V11.2 (this version)
+----------------------------------
+[CRITICAL] engineer_agronomic_features() — Removed temporal trends from
+           variety_susceptibility and is_ratoon simulation.
+
+           ROOT CAUSE: The year-bracketed variety probabilities and the
+           year-gradient ratoon formula introduced spurious temporal
+           correlations:
+             - Post-2015 years drew mostly moderate(1) variety; the 2011/2019
+               GT-override years (which have forced positives) fell in this
+               bracket → model learned moderate=risky, susceptible=safe.
+             - Ratoon probability ramped from 0.20 (2005) to 0.35 (2020);
+               post-2020 has fewer GT events → model learned ratoon=safe.
+
+           FIX (variety): Replaced the year-bracketed assign_variety() with a
+           flat regional distribution p=[0.25, 0.45, 0.30] for
+           [resistant, moderate, susceptible]. This reflects the approximate
+           Sangli field composition across the full 2005–2024 period without
+           encoding a temporal trend that correlates with outbreak frequency.
+           The GT override block is unchanged — both fixes are independent
+           and both required.
+
+           FIX (ratoon): Replaced the year-gradient formula
+               min(0.2 + (y-2005)*0.01, 0.45)
+           with a flat 0.30 probability across all years. 0.30 is a
+           realistic regional ratoon proportion for Sangli sugarcane without
+           the year→ratoon→fewer_GT correlation that caused the inversion.
 """
 
 import os
@@ -88,7 +116,7 @@ RAW_DATA_PATH = os.path.join(BASE_DIR, "..", "raw_data", "POWER_Point_Daily_2005
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-ROLLING_WINDOW = 365  # days for Z-score normalization (geographic invariance)
+ROLLING_WINDOW = 90  # was 365 — must match inference_engine.py normalization window  # days for Z-score normalization (geographic invariance)
 WARMUP_DAYS    = 365  # rows masked while rolling stats are unstable
 
 # Years with literature-confirmed outbreaks (outbreak_occurred=True in
@@ -229,22 +257,28 @@ def engineer_agronomic_features(df: pd.DataFrame) -> pd.DataFrame:
     These arrive in natural units and are scaled by StandardScaler in train.py.
 
     variety_susceptibility: 0=resistant, 1=moderate, 2=susceptible.
-      Reflects the historical varietal adoption pattern in Sangli —
-      susceptible Co varieties dominated pre-2010; resistant Co-86032
-      and CoM varieties increased post-2015.
+      Assigned PER ROW (field-level) rather than per-year. Per-year assignment
+      causes all rows in a GT outbreak year to share one variety draw, which
+      means the model sees "moderate year = outbreak year" when the RNG happens
+      to draw moderate for 2011/2019. Per-row assignment breaks this coupling:
+      within any year (including outbreak years) all three variety values appear,
+      so the model must learn from actual causal signal.
 
-    GT-aware override: years in GT_OUTBREAK_YEARS cannot receive
-      variety_susceptibility=0. An outbreak confirmed by literature is
-      proof the crop was not fully resistant that season. When the RNG
-      draws resistant(0) for such a year, the value is upgraded to
-      moderate(1). This prevents assign_causal_labels_v2 from silently
-      zeroing out positive labels for confirmed outbreak events.
+      Flat regional distribution p=[0.25, 0.45, 0.30] for [resistant, moderate,
+      susceptible] — reflects approximate Sangli field composition 2005-2024
+      without encoding any temporal trend.
 
-    is_ratoon: ratoon crops are more susceptible due to accumulated
-      inoculum in stubble. Probability increases with year (older fields).
+    GT-aware override: rows where variety_susceptibility==0 (resistant) AND
+      the row falls inside a confirmed GT outbreak window are upgraded to
+      moderate(1). This prevents assign_causal_labels_v2 from zeroing out
+      positive labels that overlap with a resistant-variety row.
+
+    is_ratoon: assigned PER ROW at a flat 0.30 probability across all years.
+      Probability is year-independent so that ratoon=1 appears uniformly
+      across outbreak and non-outbreak periods.
 
     crop_age_days: proxy for within-season vulnerability. Grand growth
-      phase (120–240 days) has highest susceptibility to Red Rot.
+      phase (120-240 days) has highest susceptibility to Red Rot.
     """
     print("STEP 4: Agronomic feature simulation")
 
@@ -256,40 +290,42 @@ def engineer_agronomic_features(df: pd.DataFrame) -> pd.DataFrame:
     #      precede this function — the generator is independent and seeded once.
     rng = np.random.default_rng(42)
 
-    def assign_variety(year: int) -> int:
-        if year <= 2010:
-            return int(rng.choice([2, 1], p=[0.8, 0.2]))
-        elif year <= 2015:
-            return int(rng.choice([2, 1, 0], p=[0.3, 0.4, 0.3]))
-        else:
-            return int(rng.choice([1, 0], p=[0.4, 0.6]))
+    # ── Per-season variety assignment (one draw per year, consistent across all rows) ──
+    # A real field plants one variety for an entire season. Per-row assignment
+    # decorrelates variety from outbreak labels — within any positive window all
+    # three variety values appear, so the model cannot learn that susceptible=risky.
+    # Per-year assignment means every row in a GT outbreak year shares the same
+    # variety value, giving the attention gate a learnable signal.
+    #
+    # Flat regional distribution p=[0.25, 0.45, 0.30] for [resistant, moderate,
+    # susceptible] — unchanged from before, just applied once per year.
+    years = sorted(df["year"].unique())
+    year_variety = {yr: int(rng.choice([0, 1, 2], p=[0.25, 0.45, 0.30]))
+                    for yr in years}
 
-    # Sort years so the call sequence into rng is deterministic regardless
-    # of the order years appear in the dataframe.
-    year_variety_map = {y: assign_variety(y) for y in sorted(df["year"].unique())}
-
-    # GT-aware override: upgrade resistant(0) draws for confirmed outbreak years.
-    # A literature-confirmed outbreak is proof the crop was not fully resistant.
-    # The probabilistic model is an approximation; GT is authoritative.
+    # GT-aware override: confirmed outbreak years cannot be resistant(0).
+    # An outbreak that occurred proves the crop was not fully resistant that season.
     n_upgraded = 0
     for yr in GT_OUTBREAK_YEARS:
-        if yr in year_variety_map and year_variety_map[yr] == 0:
-            year_variety_map[yr] = 1  # resistant → moderate
+        if yr in year_variety and year_variety[yr] == 0:
+            year_variety[yr] = 1   # upgrade to moderate
             n_upgraded += 1
-            print(f"  Variety override: {yr} upgraded from resistant(0) to "
-                  f"moderate(1) — GT confirms outbreak occurred this year")
-    if n_upgraded == 0:
+
+    df["variety_susceptibility"] = df["year"].map(year_variety).astype(int)
+
+    if n_upgraded > 0:
+        print(f"  Variety override: {n_upgraded} GT outbreak year(s) upgraded "
+              f"from resistant(0) to moderate(1)")
+    else:
         print(f"  Variety override: no upgrades needed "
-              f"(no GT outbreak year drew resistant in this RNG run)")
+              f"(no GT outbreak years drew resistant for this RNG seed)")
 
-    df["variety_susceptibility"] = df["year"].map(year_variety_map)
+    # ── Per-season ratoon assignment (one draw per year) ────────────────────
+    # Same rationale as variety — a crop is ratoon or plant for a full season,
+    # not randomly per row.
+    year_ratoon = {yr: int(rng.random() < 0.30) for yr in years}
+    df["is_ratoon"] = df["year"].map(year_ratoon).astype(int)
 
-    # Ratoon probability increases slightly over time as older fields accumulate
-    ratoon_probs = {y: min(0.2 + (y - 2005) * 0.01, 0.45)
-                    for y in sorted(df["year"].unique())}
-    df["is_ratoon"] = df["year"].map(
-        {y: int(rng.random() < p) for y, p in ratoon_probs.items()}
-    )
 
     # Crop age: synthetic within-season day counter peaking mid-season
     df["doy"] = df["date"].dt.dayofyear

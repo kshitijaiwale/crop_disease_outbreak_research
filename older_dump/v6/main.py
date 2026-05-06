@@ -52,7 +52,7 @@ def cmd_sequences():
     print(f"\nX shape: {X.shape}, y shape: {y.shape}")
 
 
-def cmd_evaluate():
+def cmd_evaluate():+
     """Run the frozen V5 evaluator against V6 backtest results."""
     import subprocess
     import shutil

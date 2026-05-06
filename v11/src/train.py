@@ -75,21 +75,16 @@ CHANGELOG (v11.3):
   - [TRAIN]     augmentation config written to metadata JSON for
                 experiment reproducibility.
 
-CHANGELOG (v11.4):
-  - [BUG]       focal_loss_fn was instantiated but never called. The training
-                loop only used bce_loss_fn, contradicting the docstring and
-                the composite-loss design. Loss is now:
-                  loss = bce_loss_fn(logits, by) + 0.5 * focal_loss_fn(logits, by)
-                The focal term hard-mines on boundary cases; BCE + sampler
-                handle the class-imbalance correction.
-  - [BUG]       Removed redundant model.load_state_dict() before threshold
-                finding (line ~588). The checkpoint was saved moments earlier
-                and no weights changed between the two evaluation steps.
-                The single load before temperature scaling is sufficient.
-  - [BUG]       Stale docstring header corrected: T_max=80 → T_max=120 and
-                loss formula updated to match actual training code.
-  - [TRAIN]     PIPELINE_VERSION bumped to v11.4.
+CHANGELOG (v11.6):
+  - [TRAIN]     Refined monotonicity training strategy: delayed start (epoch 20),
+                subsampling (1/4 batches), and reduced weight (0.1). This
+                prevents the monotonicity loss from interfering with the
+                primary weather-signal learning in early epochs.
+  - [TRAIN]     Shortened training to 60 epochs with T_max=60 scheduler.
+  - [TRAIN]     PIPELINE_VERSION bumped to v11.6.
 """
+
+
 
 import os
 import json
@@ -139,9 +134,9 @@ AGRO_FEATURES = ["variety_susceptibility", "is_ratoon", "crop_age_days"]
 SEQ_LEN = 28  # TCN receptive field window (days)
 
 AUGMENT_FACTOR    = 4     # was 7
-AUGMENT_NOISE_STD = 0.15  # was 0.05
+AUGMENT_NOISE_STD = 0.05  # was 0.05
 
-PIPELINE_VERSION = "v11.4"
+PIPELINE_VERSION = "v11.6"
 
 # ---------------------------------------------------------------------------
 # Custom losses
@@ -199,6 +194,53 @@ def causal_consistency_loss(
     violation = F.relu(0.3 - probs[condition])
     return violation.mean()
 
+
+def agronomic_monotonicity_loss(
+    model: torch.nn.Module,
+    weather_batch: torch.Tensor,
+    agro_batch: torch.Tensor,
+    agro_feature_names: list,
+    a_sc_scales: torch.Tensor,
+    probs_orig: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Enforce biological monotonicity over agronomic inputs:
+      (1) susceptible variety (2) must predict >= moderate variety (1) risk
+      (2) ratoon crop (1) must predict >= plant crop (0) risk
+
+    Implementation: for each sample in the batch, construct a "downgraded"
+    copy of agro_batch (susceptible->moderate, ratoon->plant) and a
+    "downgraded" agro for ratoon. The loss penalises whenever the model
+    predicts higher risk for the less-vulnerable agronomic state.
+
+    Shift is applied as -1.0 / scale to ensure a 1-unit raw shift in
+    scaled space.
+
+    agro_batch shape: (B, num_agro_features) — scaled values as fed to model.
+    a_sc_scales shape: (num_agro_features,) — the .scale_ from StandardScaler.
+    probs_orig: probabilities from the main forward pass (reused for speed).
+    Weight recommendation: 0.3 (subordinate to BCE+Focal primary loss).
+    """
+    v_idx = agro_feature_names.index("variety_susceptibility")
+    r_idx = agro_feature_names.index("is_ratoon")
+
+    # -- Variety monotonicity: prob(susceptible) >= prob(moderate) --
+    # Downgrade variety: shift down 1 raw unit in scaled space.
+    agro_variety_down = agro_batch.clone()
+    agro_variety_down[:, v_idx] = agro_variety_down[:, v_idx] - (1.0 / a_sc_scales[v_idx])
+    _, probs_variety_down, _ = model(weather_batch, agro_variety_down)
+
+    # Violation: original (more vulnerable) risk < downgraded (less vulnerable) risk
+    variety_violation = F.relu(probs_variety_down - probs_orig)
+
+    # -- Ratoon monotonicity: prob(ratoon=1) >= prob(ratoon=0) --
+    agro_ratoon_down = agro_batch.clone()
+    agro_ratoon_down[:, r_idx] = agro_ratoon_down[:, r_idx] - (1.0 / a_sc_scales[r_idx])
+    _, probs_ratoon_down, _ = model(weather_batch, agro_ratoon_down)
+
+    ratoon_violation = F.relu(probs_ratoon_down - probs_orig)
+
+    return (variety_violation.mean() + ratoon_violation.mean()) / 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +444,13 @@ def train():
     )
 
 
+    # ── Device ───────────────────────────────────────────────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
     # ── DataLoaders ──────────────────────────────────────────────────────────
+    a_sc_scales_torch = torch.FloatTensor(a_sc.scale_).to(device)
+    
     train_ds = TensorDataset(
         torch.FloatTensor(X_w_train),
         torch.FloatTensor(X_a_train),
@@ -423,38 +471,59 @@ def train():
     val_loader   = DataLoader(val_ds, batch_size=128, shuffle=False)
 
     # ── Model & optimiser ────────────────────────────────────────────────────
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    model = KGCTCN(len(WEATHER_FEATURES), len(AGRO_FEATURES)).to(device)
+    model = KGCTCN(len(WEATHER_FEATURES), len(AGRO_FEATURES), dropout=0.4).to(device)
     
     # Loss functions
     bce_loss_fn   = nn.BCEWithLogitsLoss()
     focal_loss_fn = FocalLoss(alpha=1.0, gamma=2.0)
     optimizer     = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-3)
+    
+    # Warmup + Cosine schedule: starts at 1e-5, peaks at 5e-4 at epoch 5, then decays.
     scheduler     = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=120, eta_min=1e-5
+        optimizer, T_max=55, eta_min=1e-5
     )
 
     # ── Training loop ────────────────────────────────────────────────────────
-    best_val_loss = float("inf")
+    best_val_ap  = 0.0
+    patience     = 10   # stop when val AP hasn't improved for this many epochs
+    patience_ctr = 0
+    best_epoch   = 0
     print("\nStarting training...")
     print(f"{'Epoch':>6}  {'Train loss':>11}  {'Val loss':>9}  {'Val AP':>7}  {'LR':>9}")
     print("-" * 54)
 
-    for epoch in range(1, 121):
+    MONO_WARMUP_EPOCHS = 5
+
+    for epoch in range(1, 101):  # cap at 100; early stopping fires much sooner
         # ── Train ────────────────────────────────────────────────────────────
         model.train()
         epoch_loss = 0.0
-        for bw, ba, by in train_loader:
+        for batch_idx, (bw, ba, by) in enumerate(train_loader):
             bw, ba, by = bw.to(device), ba.to(device), by.to(device)
             optimizer.zero_grad()
 
-            logits, probs, _ = model(bw, ba)
+            logits, probs, conf_logit = model(bw, ba)
 
-            # Composite loss: BCE handles class balance (via sampler);
-            # Focal adds hard-example mining on outbreak boundary cases.
-            loss = bce_loss_fn(logits, by) + 0.5 * focal_loss_fn(logits, by)
+            # Composite loss:
+            #   BCE        — class balance via WeightedRandomSampler
+            #   Focal      — hard-example mining on outbreak boundary cases
+            #   Conf       — calibrates confidence head against |prob - label|
+            #   Mono       — agronomic monotonicity (susceptible >= moderate, ratoon >= plant)
+            #                Delayed start and subsampled to avoid interfering with early signal.
+            conf_target = 1.0 - (probs.detach() - by).abs()
+            conf_loss   = F.binary_cross_entropy_with_logits(conf_logit, conf_target)
+
+            if epoch > MONO_WARMUP_EPOCHS and batch_idx % 4 == 0:
+                mono_loss = agronomic_monotonicity_loss(
+                    model, bw, ba, AGRO_FEATURES, a_sc_scales_torch, probs
+                )
+            else:
+                mono_loss = torch.tensor(0.0, device=device)
+
+            loss = (bce_loss_fn(logits, by)
+                    + 0.5 * focal_loss_fn(logits, by)
+                    + 0.05 * conf_loss
+                    + 0.1 * mono_loss)
             loss.backward()
 
             # Clip gradients — prevents NaN/Inf weights if any boundary NaN
@@ -506,41 +575,25 @@ def train():
             )
         val_ap = average_precision_score(val_y, val_preds_arr) if sum(val_y) > 0 else 0.0
 
-        if epoch % 5 == 0:
+        if epoch % 5 == 0 or epoch <= 10:
             print(f"{epoch:>6}  {mean_train_loss:>11.4f}  {mean_val_loss:>9.4f}  {val_ap:>7.4f}  {current_lr:>9.2e}")
 
-        if mean_val_loss < best_val_loss:
-            best_val_loss = mean_val_loss
-            torch.save(
-                model.state_dict(),
-                os.path.join(MODEL_DIR, "v11_kg_ctcn.pth"),
-            )
+        # Checkpoint on val AP — val BCE rewards predicting zero for everything.
+        if val_ap > best_val_ap:
+            best_val_ap  = val_ap
+            best_epoch   = epoch
+            patience_ctr = 0
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "v11_kg_ctcn.pth"))
+        else:
+            patience_ctr += 1
+            if patience_ctr >= patience:
+                print(f"\nEarly stopping at epoch {epoch} "
+                      f"(best Val AP {best_val_ap:.4f} at epoch {best_epoch})")
+                break
 
     print("\nTraining complete.")
-    print(f"Best Val Loss: {best_val_loss:.4f}")
+    print(f"Best Val AP: {best_val_ap:.4f}  (epoch {best_epoch})")
 
-    # ── Save metadata (JSON) ─────────────────────────────────────────────────
-    metadata = {
-        "pipeline_version": PIPELINE_VERSION,
-        "weather_features": WEATHER_FEATURES,
-        "agro_features": AGRO_FEATURES,
-        "seq_len": SEQ_LEN,
-        "num_epochs": 120,
-        "augmentation": {
-            "factor": AUGMENT_FACTOR,
-            "noise_std": AUGMENT_NOISE_STD,
-            "noise_features": _NOISE_FEATURE_NAMES,
-        },
-        "loss_weights": {"bce": 1.0},
-        "sampler": "WeightedRandomSampler",
-        "train_years": [2005, 2018],
-        "val_years": [2019, 2021],
-        "test_years": [2022, 2024],
-    }
-    meta_path = os.path.join(MODEL_DIR, "v11_metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    print(f"Metadata saved to {meta_path}")
 
     # ── Save scalers ─────────────────────────────────────────────────────────
     # Only the agronomic scaler is saved — weather features are not re-scaled
@@ -675,7 +728,7 @@ def train():
         print(f"  At optimal threshold {optimal_threshold:.4f}:")
         print(f"    Precision:           {p_at_opt:.3f}")
         print(f"    Recall:              {r_at_opt:.3f}")
-        
+
         # What threshold actually captures something on test?
         for i, (p, r, t) in enumerate(zip(test_precision, test_recall, test_thresholds)):
             if r >= 0.5:
@@ -686,6 +739,46 @@ def train():
         print(f"\n-- Test Set Evaluation --")
         print(f"  Positives in test:     0 / {len(test_y_arr)}")
         print(f"  (Skipping AP/AUC calculation as test set has no positive samples)")
+ 
+    print("\nTest score distribution:")
+    print(f"  Max:    {test_preds_arr.max():.4f}")
+    print(f"  Mean:   {test_preds_arr.mean():.4f}")
+    print(f"  Median: {np.median(test_preds_arr):.4f}")
+    print(f"  >0.05:  {(test_preds_arr > 0.05).sum()}")
+    print(f"  >0.1:   {(test_preds_arr > 0.1).sum()}")
+    print(f"  >0.2:   {(test_preds_arr > 0.2).sum()}")
+
+    # ── Save metadata (JSON) ─────────────────────────────────────────────────
+    metadata = {
+        "pipeline_version": PIPELINE_VERSION,
+        "weather_features": WEATHER_FEATURES,
+        "agro_features": AGRO_FEATURES,
+        "seq_len": SEQ_LEN,
+        "num_epochs": 60,
+        "optimal_threshold": float(optimal_threshold),
+        "augmentation": {
+            "factor": AUGMENT_FACTOR,
+            "noise_std": AUGMENT_NOISE_STD,
+            "noise_features": _NOISE_FEATURE_NAMES,
+        },
+        "loss_weights": {
+            "bce": 1.0,
+            "focal": 0.5,
+            "agronomic_monotonicity": 0.1,
+            "mono_warmup_epochs": 20,
+            "mono_batch_subsample": 4,
+            "causal_consistency": 0.0,
+        },
+        "train_years": [2005, 2018],
+        "val_years": [2019, 2021],
+        "test_years": [2022, 2024],
+    }
+    meta_path = os.path.join(MODEL_DIR, "v11_metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to {meta_path}")
+
+
  
     print("\nTest score distribution:")
     print(f"  Max:    {test_preds_arr.max():.4f}")

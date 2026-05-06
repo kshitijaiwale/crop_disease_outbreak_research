@@ -68,6 +68,8 @@ class DeploymentAPI:
             explanations.append("Nighttime temperatures from two weeks ago were optimal for initial fungal incubation.")
         if v_susc >= 2:
             explanations.append("Your crop variety is highly susceptible to Red Rot in these conditions.")
+        elif v_susc == 0:
+            explanations.append("Your resistant crop variety is currently helping to lower the overall outbreak risk.")
             
         if not explanations:
             explanations.append("Weather conditions are currently normal with no major outbreak drivers detected.")
