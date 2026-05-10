@@ -48,7 +48,8 @@ Access the interactive documentation at `http://localhost:8000/docs`.
 
 ### Running the Farmer Dashboard
 ```bash
-streamlit run v11/src/streamlit_app.py
+python -m streamlit run v11/src/streamlit_app.py
+
 ```
 
 ### Stress Testing & Validation

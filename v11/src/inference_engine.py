@@ -94,26 +94,65 @@ class V11InferenceEngine:
         weather_seq = self._preprocess_weather_window(raw_weather)
         
         # 2. Agronomic feature alignment and scaling
-        a_raw = np.array([[agro_inputs[f] for f in self.agro_features]], dtype=np.float32)
+        # Post-hoc Patch: Construct 6-way batch for monotonicity check (3 varieties x 2 ratoon states)
+        # This ensures that Susceptible >= Moderate >= Resistant and Ratoon >= Plant
+        # even if the underlying model weights have drifted or become miscalibrated.
+        current_age = agro_inputs.get("crop_age_days", 180)
+        agro_batch = []
+        for v in [0, 1, 2]: # Resistant, Moderate, Susceptible
+            for r in [0, 1]: # Plant, Ratoon
+                agro_batch.append([v, r, current_age])
+        
+        a_raw = np.array(agro_batch, dtype=np.float32)
         X_a   = torch.FloatTensor(self.agro_scaler.transform(a_raw)).to(self.device)
-        X_w   = torch.FloatTensor(weather_seq).unsqueeze(0).to(self.device)
+        
+        # Weather sequence duplicated for the batch
+        X_w   = torch.FloatTensor(weather_seq).unsqueeze(0).expand(len(agro_batch), -1, -1).to(self.device)
         
         # 3. Model execution with temperature calibration
         with torch.no_grad():
-            logits, _, conf_logit = self.model(X_w, X_a)
-            risk_score = torch.sigmoid(logits / self.temperature).item()
-            confidence = torch.sigmoid(conf_logit).item()
+            logits, _, conf_logits = self.model(X_w, X_a)
+            all_scores = torch.sigmoid(logits / self.temperature).cpu().numpy().flatten()
+            all_confs  = torch.sigmoid(conf_logits).cpu().numpy().flatten()
+            all_logits = logits.cpu().numpy().flatten()
 
-        # 4. KG biological gate — suppress false positives when the known
+        # Reshape to (Variety, Ratoon)
+        score_matrix = all_scores.reshape(3, 2)
+        conf_matrix  = all_confs.reshape(3, 2)
+        logit_matrix = all_logits.reshape(3, 2)
+        
+        # 4. Monotonicity Correction (Causal Anchor)
+        # Ensure strict monotonicity: risk(v, r) >= risk(v', r') + margin
+        corrected_matrix = score_matrix.copy()
+        margin = 0.02
+        
+        for v in range(3):
+            for r in range(2):
+                val = score_matrix[v, r]
+                # Compare against lower vulnerability neighbors
+                if v > 0:
+                    val = max(val, corrected_matrix[v-1, r] + margin)
+                if r > 0:
+                    val = max(val, corrected_matrix[v, r-1] + margin)
+                corrected_matrix[v, r] = min(val, 0.99)
+        
+        # Extract requested state
+        target_v = int(agro_inputs.get("variety_susceptibility", 1))
+        target_r = int(agro_inputs.get("is_ratoon", 0))
+        
+        # Ensure indices are in bounds (clip if farmer provides out-of-range values)
+        target_v = max(0, min(2, target_v))
+        target_r = max(0, min(1, target_r))
+
+        raw_risk   = float(score_matrix[target_v, target_r])
+        risk_score = float(corrected_matrix[target_v, target_r])
+        confidence = float(conf_matrix[target_v, target_r])
+        logit_val  = float(logit_matrix[target_v, target_r])
+        
+        is_monotonicity_corrected = risk_score > (raw_risk + 1e-4)
+
+        # 5. KG biological gate — suppress false positives when the known
         #    causal conditions for Red Rot are absent.
-        #    These are hard biological priors, not learned thresholds:
-        #      RH_persist_7d < 2.0 : fewer than 2 high-humidity days this week
-        #                            → pathogen cannot sustain infection pressure
-        #      Rain_sum_7d   < 5.0 : less than 5 mm rainfall this week
-        #                            → insufficient moisture for spore dispersal
-        #    If BOTH conditions are dry, cap risk at Low regardless of model score.
-        #    This directly targets the 19% FPR: most false alarms occur in
-        #    dry weeks where the model fires on temperature anomalies alone.
         WF = self.weather_features
         rh_persist = float(weather_seq[-1, WF.index("RH_persist_7d")])
         rain_7d    = float(weather_seq[-1, WF.index("Rain_sum_7d")])
@@ -122,9 +161,7 @@ class V11InferenceEngine:
         if not kg_gate_open:
             risk_score = min(risk_score, 0.15)   # cap at Low ceiling
 
-        # 5. Risk class — use temperature-calibrated thresholds.
-        #    Medium entry at 0.20 (raised from F2-optimal ~0.09 which caused
-        #    19% FPR). High entry kept at 0.70.
+        # 6. Risk class — use temperature-calibrated thresholds.
         risk_class = (
             "High"   if risk_score >= 0.70 else
             "Medium" if risk_score >= 0.20 else
@@ -132,16 +169,18 @@ class V11InferenceEngine:
         )
 
         return {
-            "risk_score":            risk_score,
-            "risk_class":            risk_class,
-            "confidence_score":      confidence,
-            "logits":                logits.item(),
-            "temperature":           self.temperature,
-            "kg_gate_open":          kg_gate_open,
-            "rh_persist_7d":         rh_persist,
-            "rain_sum_7d":           rain_7d,
-            "raw_weather_sequence":  weather_seq,
-            "weather_feature_names": self.weather_features,
-            "agro_inputs":           agro_inputs,
-            "is_signal_saturated":   abs(logits.item()) > 10,
+            "risk_score":                risk_score,
+            "risk_class":                risk_class,
+            "confidence_score":          confidence,
+            "logits":                    logit_val,
+            "temperature":               self.temperature,
+            "kg_gate_open":              kg_gate_open,
+            "rh_persist_7d":             rh_persist,
+            "rain_sum_7d":               rain_7d,
+            "raw_weather_sequence":      weather_seq,
+            "weather_feature_names":     self.weather_features,
+            "agro_inputs":               agro_inputs,
+            "is_signal_saturated":       abs(logit_val) > 10,
+            "is_monotonicity_corrected": is_monotonicity_corrected,
+            "raw_risk_pre_correction":   raw_risk if is_monotonicity_corrected else None
         }
